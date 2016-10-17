@@ -31,9 +31,20 @@
 # -for Darwin http://www.heystephenwood.com/2013/09/install-gnu-grep-on-mac-osx.html
 # -mount point must be under /User/${USER}
 #
-# TO-DO: -add routines for UF and HF containers with eventgen.py
+# TO-DO:
+# -add routines for UF and HF containers with eventgen.py
 #	-add DS containers with default serverclass.conf
 #	-ability to adjust RF and SF
+#
+# -add ngnix load balancer in front of SHCs
+# -when LM exists setup as master all others as slaves (other complex scenarios?)
+# -fix:search heads and indexers dont appear to get peered upon creation
+# -fix:os checks for bc and dnsmasq
+# -initially create the project home dir or use pwd by default instead of /home/<user>/; copyig over initial files if they do not exist.
+# -cmd line way to enable
+# -way to jump out of the menu into ssh session of a box?
+# -chaos monkey like; drop some random boxes
+# -need a way to run searches / validation test cases. 
 #################################################################################
 
 #Network stuff
