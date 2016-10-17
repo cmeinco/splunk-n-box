@@ -549,6 +549,46 @@ return 0
 } #end add_license_file()
 #-----------------------------------------------------------------------------
 #-----------------------------------------------------------------------------
+update_deployment_apps () {
+#finds a DS* container and copies deployment-apps to there, then reloads the deployment server
+
+#hard coding for now, no good reason to not use this name anyway
+DSAPPS_DIR="deployment-apps"
+
+if [ ! -d $PROJ_DIR/$DSAPPS_DIR ]; then
+  #nothing to nothing copied! Done Son.
+  printf "${Red} $PROJ_DIR/$DSAPPS_DIR Does Not Exist, go create a DS01 container! ${NC}\n" >&3
+else
+  #loop through instances and find a name with DS
+  #$PROJ_DIR/$DSAPPS_DIR
+  count=`docker ps -aq|wc -l`
+  if [ $count == 0 ]; then
+  	echo "No containers found"
+  	return 0
+  fi
+  for id in $(docker ps -aq); do
+
+      hostname=`docker ps -a --filter id=$id --format "{{.Names}}"`
+
+      if ( contains "$hostname" "DS" ); then
+
+        CMD="docker cp $PROJ_DIR/$DSAPPS_DIR $hostname:/opt/splunk/etc/deployment-apps"; OUT=`$CMD`
+        printf "\t->Copying dir. " >&3 ; display_output "$OUT" "" "n" "3"
+        printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&3
+
+        #reload the deployment server on the hostname
+        CMD="docker exec -d $hostname /opt/splunk/bin/splunk reload deploy-server -auth $USERADMIN:$USERPASS"
+        OUT=`$CMD`; display_output "$OUT" "Starting splunk server daemon" "n" "3"
+        printf "${DarkGray}CMD:[$CMD]${NC}\n" >&4
+
+      fi
+  done
+
+fi
+return 0
+} #end update_deployment_apps()
+#-----------------------------------------------------------------------------
+#-----------------------------------------------------------------------------
 add_deploymentclient_file () {
 #This function will just copy the deploymentclient.conf file and bounce the instance
 # $1=fullhostname
@@ -1610,7 +1650,8 @@ display_menu () {
 	printf "${LightBlue}8${NC}) Remove IP aliases on the Ethernet interface${NC}\n"
 	printf "${LightBlue}9${NC}) RESTART all splunkd instances\n\n"
 	printf "${Green}10${NC}) Clustering Menu \n\n"
-  printf "${LightBlue}11${NC}) ADD deploymentclient.conf ${DarkGray}[splunkd restarted; excludes DS names]${NC}\n"
+  printf "${LightBlue}11${NC}) ADD deploymentclient.conf to non-DS containers ${DarkGray}[splunkd restarted after copy]${NC}\n"
+  printf "${LightBlue}12${NC}) Copy deployment-apps DS ${DarkGray}[reload deploy-server]${NC}\n"
 	echo
 return 0
 }    #end display_menu()
@@ -1706,6 +1747,7 @@ do
 		10 ) clustering_menu ;;
 
     11) for i in `docker ps --format "{{.Names}}"`; do add_deploymentclient_file $i; done;;
+    12) update_deployment_apps;;
 
 		q|Q ) echo;
 		      echo -e "Quitting... Please send feedback to mhassan@splunk.com! \0360\0237\0230\0200";
