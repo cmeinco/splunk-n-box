@@ -44,7 +44,7 @@
 # -cmd line way to enable
 # -way to jump out of the menu into ssh session of a box?
 # -chaos monkey like; drop some random boxes
-# -need a way to run searches / validation test cases. 
+# -need a way to run searches / validation test cases.
 #################################################################################
 
 #Network stuff
@@ -562,6 +562,7 @@ return 0
 #-----------------------------------------------------------------------------
 update_deployment_apps () {
 #finds a DS* container and copies deployment-apps to there, then reloads the deployment server
+#todo: should probably also copy/update the serverclass.conf before the reload
 
 #hard coding for now, no good reason to not use this name anyway
 DSAPPS_DIR="deployment-apps"
@@ -571,14 +572,11 @@ if [ ! -d $PROJ_DIR/$DSAPPS_DIR ]; then
   printf "${Red} $PROJ_DIR/$DSAPPS_DIR Does Not Exist, go create a DS01 container! ${NC}\n" >&3
 else
   #loop through instances and find a name with DS
-  #$PROJ_DIR/$DSAPPS_DIR
   count=`docker ps -aq|wc -l`
   if [ $count == 0 ]; then
-  	echo "No containers found"
-  	return 0
+    printf "${Red}No Containers Found. \n\n" >&3
   fi
   for id in $(docker ps -aq); do
-
       hostname=`docker ps -a --filter id=$id --format "{{.Names}}"`
 
       if ( contains "$hostname" "DS" ); then
@@ -588,8 +586,9 @@ else
         printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&3
 
         #reload the deployment server on the hostname
+        #fix:do not understand why output not being captured on this command
         CMD="docker exec -d $hostname /opt/splunk/bin/splunk reload deploy-server -auth $USERADMIN:$USERPASS"
-        OUT=`$CMD`; display_output "$OUT" "Starting splunk server daemon" "n" "3"
+        OUT=`$CMD`; display_output "$OUT" "Reloading serverclass" "n" "3"
         printf "${DarkGray}CMD:[$CMD]${NC}\n" >&4
 
       fi
@@ -601,29 +600,56 @@ return 0
 #-----------------------------------------------------------------------------
 #-----------------------------------------------------------------------------
 add_deploymentclient_file () {
-#This function will just copy the deploymentclient.conf file and bounce the instance
-# $1=fullhostname
-# uses global $DSCLI_FILE
-hostname=$1
-if [ ! -f $PROJ_DIR/$DSCLI_FILE ]; then
-  #dont copy nothing there chief
-  printf "${Red} $DSCLI_FILE Does Not Exist! ${NC}\n" >&3
+  #This function will just copy the deploymentclient.conf file and bounce the instance
+  # $1=hostname
+  # uses global $DSCLI_FILE
+  hostname=$1
+  CMD="docker cp $PROJ_DIR/$DSCLI_FILE  $hostname:/opt/splunk/etc/system/local/"
+  printf "\t->add_deploymentclient_file \n" >&5
 
-elif ( contains "$hostname" "DS" ); then
-  #dont copy to a DS (DS cannot be a DS client in most recent versions of Splunk),
-  # even though it's a legit use case, don't get me started)
-  printf "${Red} Skipping DS Names! ${NC}\n" >&3
+  if [ ! -f $PROJ_DIR/$DSCLI_FILE ]; then
+    #dont copy nothing there chief
+    printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&3
+    printf "${Red} $DSCLI_FILE does not Exist! ${NC}\n" >&3
 
-else
-  #todo:cp file from container and only restart if the 2 versions are different
-  CMD="docker cp $PROJ_DIR/$DSCLI_FILE  $hostname:/opt/splunk/etc/system/local/"; OUT=`$CMD`
-  printf "\t->Copying file(s). " >&3 ; display_output "$OUT" "" "n" "3"
-  printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&3
-  restart_splunkd "$hostname"
-  printf "${Green} Done! ${NC}\n" >&3
-fi
-return 0
+  elif ( contains "$hostname" "DS" ); then
+    #dont copy to a DS (DS cannot be a DS client in most recent versions of Splunk),
+    # even though it's a legit use case, don't get me started)
+    printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&3
+    printf "${Red} $hostname skipped. DS named containers skipped! ${NC}\n" >&3
+
+  else
+    #todo:cp file from container and only restart if the 2 versions are different
+    OUT=`$CMD`
+    printf "\t->Copying file(s). " >&3 ; display_output "$OUT" "" "n" "3"
+    printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&3
+    restart_splunkd "$hostname"
+    printf "${Green} Done! ${NC}\n" >&3
+
+  fi
+  return 0
 } #end add_deploymentclient_file()
+#-----------------------------------------------------------------------------
+#-----------------------------------------------------------------------------
+generate_deploymentclient_conf () {
+   #finds the DS and generate the deploymentclient based on it
+   #todo: handle a more complex scenario with tiered deployment servers etc.
+   count=`docker ps -aq|wc -l`
+   if [ $count == 0 ]; then
+     #no DS running, start one first
+     printf "${LightGray}No DS running, create one first.${NC}\n"  >&3
+   else
+     for id in $(docker ps -aq); do
+         hostname=`docker ps -a --filter id=$id --format "{{.Names}}"`
+         if ( contains "$hostname" "DS" ); then
+             echo -e "[deployment-client]\n[target-broker:deploymentServer]\ntargetUri=$hostname:8089\n" > $PROJ_DIR/$DSCLI_FILE
+             cat $PROJ_DIR/$DSCLI_FILE >&5
+             printf "${LightGray}Generated $PROJ_DIR/$DSCLI_FILE for $hostname ${Green}Done.${NC}\n"  >&3
+         fi
+     done
+   fi
+   return 0
+} #end generate_deploymentclient_conf()
 #-----------------------------------------------------------------------------
 #-----------------------------------------------------------------------------
 reset_splunk_passwd () {
@@ -1661,12 +1687,99 @@ display_menu () {
 	printf "${LightBlue}8${NC}) Remove IP aliases on the Ethernet interface${NC}\n"
 	printf "${LightBlue}9${NC}) RESTART all splunkd instances\n\n"
 	printf "${Green}10${NC}) Clustering Menu \n\n"
-  printf "${LightBlue}11${NC}) ADD deploymentclient.conf to non-DS containers ${DarkGray}[splunkd restarted after copy]${NC}\n"
-  printf "${LightBlue}12${NC}) Copy deployment-apps DS ${DarkGray}[reload deploy-server]${NC}\n"
+  printf "${Cyan}11${NC}) Deployment Server Menu \n\n"
+
 	echo
 return 0
 }    #end display_menu()
 #---------------------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------------------------
+display_deployment_server_menu () {
+	clear
+	printf "${Green}Docker Splunk Infrastructure Management -> Deployment Server Menu:${NC}${LightBlue}[$dockerinfo]${NC}\n"
+	printf "=====================[$dockerinfo2] [OS:$os FreeMem:$max_mem GB MaxLoad:$MAXLOADAVG] [LogLevel:$loglevel]==\n\n"
+	printf "${Yellow}B${NC}) Go back to MAIN menu\n\n"
+
+  printf "${LightBlue}0${NC}) Build Stand-alone DS ${DarkGray}[Only 1]${NC}\n"
+  printf "${LightBlue}1${NC}) Generate deploymentclient.conf ${DarkGray}[saved to $PROJ_DIR/$DSCLI_FILE]${NC}\n"
+  printf "${LightBlue}2${NC}) ADD deploymentclient.conf to non-DS containers ${DarkGray}[splunkd restarted after copy]${NC}\n"
+  printf "${LightBlue}3${NC}) Copy deployment-apps DS ${DarkGray}[reload deploy-server]${NC}\n"
+
+  echo
+
+  return 0
+} #end display_deployment_server_menu()
+#---------------------------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------------------------
+deployment_server_menu () {
+#This function captures user selection for deployment_server_menu
+while true;
+do
+        dockerinfo=`docker info|head -5| tr '\n' ' '|sed 's/: /:/g'`
+        display_deployment_server_menu
+        choice=""
+        read -p "Select a number: " choice
+        case "$choice" in
+          B|b) return 0;;
+
+          # Build a DS
+          0) buildit=0
+            count=`docker ps -aq|wc -l`
+            if [ $count == 0 ]; then
+            	# easy, no other containers, just build the first one
+              buildit=1
+            else
+              for id in $(docker ps -aq); do
+                  hostname=`docker ps -a --filter id=$id --format "{{.Names}}"`
+                  if ( contains "$hostname" "DS" ); then
+                      buildit=0
+                      printf "${LightGray}$hostname already exists skipping build...${NC}\n"  >&3
+                  fi
+              done
+            fi
+            if [ $buildit -eq 1 ]; then
+              create_generic_splunk "DS" "1"
+            fi
+            read -p "Hit <ENTER> to continue..."
+            ;;
+          #end 0) Build a DS
+
+          1) generate_deploymentclient_conf
+            read -p "Hit <ENTER> to continue..."
+            ;;
+
+          #should cluster members have a deployment client?  i dont see why not. need to test
+          #doesnt fail pretty when no containers are running
+          #would be nice to not even enable these options or maybe grey them out
+          2) for i in `docker ps --format "{{.Names}}"`; do
+                add_deploymentclient_file $i
+              done
+            read -p "Hit <ENTER> to continue..."
+            ;;
+
+          3) update_deployment_apps
+            read -p "Hit <ENTER> to continue..."
+            ;;
+
+          #todo:
+            #Generate some default serverclasses in serverclass.con?
+            # Merge with local serverclass.conf or ?
+            #Generate deployment-apps (only based on what is running?)  seems like this should/could be able to be pre-built static
+              #names should be different to show they were generated
+                #ie - generated-outputs, generated-license-lm, generated-disablesplunkweb, generated-idxinputs
+
+            #all, non indexers, non DS (might not be bad if it still included it or tried),
+            # SearchHeads (in SHC), non SearchHeads (in SHC), Indexers (in IDXC),
+            # non Indexers (in IDXC), #nix Forwarders?, #eventGenForwarders, #syslogGen
+
+		      q|Q ) echo "Exit!" ;break ;;
+                *) read -p "Hit <ENTER> to continue..." ;;
+        esac  #end case ---------------------------
+        echo "------------------------------------------------------";echo
+done
+return 0
+}  #end deployment_server_menu()
+#---------------------------------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------------------------
 ### MAIN BEGINS #####
 
@@ -1757,11 +1870,10 @@ do
 
 		10 ) clustering_menu ;;
 
-    11) for i in `docker ps --format "{{.Names}}"`; do add_deploymentclient_file $i; done;;
-    12) update_deployment_apps;;
+    11) deployment_server_menu;;
 
 		q|Q ) echo;
-		      echo -e "Quitting... Please send feedback to mhassan@splunk.com! \0360\0237\0230\0200";
+		      echo -e "Quitting... Please send feedback to mhassan@splunk.com! \0360\0237\0230\0200\n";
 		      break ;;
 	esac  #end case ---------------------------
 
