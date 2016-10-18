@@ -17,6 +17,7 @@
 #	-Low resources requirements
 #	-Eliminate the need to learn docker (but you should)
 #	-OSX support
+# -add ngnix load balancer in front of SHCs
 #
 # Licenses: 	Licensed under GPL v3 <link>
 # Author:    	mhassan@splunk.com
@@ -36,15 +37,15 @@
 #	-add DS containers with default serverclass.conf
 #	-ability to adjust RF and SF
 #
-# -add ngnix load balancer in front of SHCs
 # -when LM exists setup as master all others as slaves (other complex scenarios?)
 # -fix:search heads and indexers dont appear to get peered upon creation
 # -fix:os checks for bc and dnsmasq
 # -initially create the project home dir or use pwd by default instead of /home/<user>/; copyig over initial files if they do not exist.
-# -cmd line way to enable
 # -way to jump out of the menu into ssh session of a box?
 # -chaos monkey like; drop some random boxes
-# -need a way to run searches / validation test cases.
+# -need a way to run searches / validation test cases./ run a test suite
+# -fix:something broken:spin up LB01 then do SHC, start at LB01+1 instead of START_ALIAS_LINUX
+# -fix:parameterize LB01 name and IP
 #################################################################################
 
 #Network stuff
@@ -83,6 +84,8 @@ SPLUNK_IMAGE="mhassan/splunk"		#my own built image
 #SPLUNK_IMAGE="xeor/splunk"
 BASEHOSTNAME="IDX"			#default hostname to create
 SPLUNKNET="splunk-net"			#default name for splunk docker network (host-to-host comm)
+
+NGINX_IMAGE="nginx"
 
 #Set the local splunkd path if you're running Splunk on this docker-host (ex laptop).
 #Used in validation_check() routine to detect local instance and kill it, otherwise it will interfere with this script operation
@@ -479,6 +482,31 @@ else
 fi
 #-----------
 
+#-----------
+printf "${LightBlue}==>${NC} Checking if NGNIX image is available [$NGINX_IMAGE]..."
+image_ok=`docker images|grep $NGINX_IMAGE`
+if [ -z "$image_ok" ]; then
+	printf "${Red}NOT FOUND!${NC}\n\n"
+  printf "I will attempt to download this image. If that doesn't work you are on your own.\n"
+
+	read -p "Pull [$NGINX_IMAGE] from docker hub (may take time)? [Y/n]? " answer
+  if [ -z "$answer" ] || [ "$answer" == "Y" ] || [ "$answer" == "y" ]; then
+    printf "${Yellow}Running [docker pull $NGINX_IMAGE]...${NC}\n"
+		docker pull $NGINX_IMAGE
+		printf "\n"
+		printf "${Yellow}Running [docker images]...${NC}\n"
+    docker images
+		printf "\n"
+  else
+    printf "${Red}Cannot proceed with nginx image. Exiting!${NC}\n"
+    printf "See yourself. Adios. \n\n"
+    exit
+  fi
+else
+  printf "${Green} OK!${NC}\n"
+fi
+#-----------
+
 #TO DO:
 #check dnsmasq
 #check $USER
@@ -559,6 +587,74 @@ fi
 return 0
 } #end add_license_file()
 #-----------------------------------------------------------------------------
+#
+update_nginx_conf () {
+  # may want to test to single stand alone SH
+  # OR more expected test going to SH in SHC
+  sh_list=`docker ps -a --filter name="SH|sh" --format "{{.Names}}"|sort`
+  printf "${Green}SHs${NC}: ";        printf "%-5s " $sh_list;echo
+  echo "---------- Current running SHC's -------"
+  prev_list=''
+  for i in $sh_list; do
+  	sh_cluster=`docker exec -ti $i /opt/splunk/bin/splunk show shcluster-status -auth $USERADMIN:$USERPASS | $GREP -i label |awk '{print $3}'| sed -e 's/^M//g' | tr -d '\r' | tr  '\n' ' ' `
+  	if ( contains "$sh_cluster" "$prev_list" );  then
+  		continue
+  	else
+      printf "${Yellow}$i${NC}: %s" "$sh_cluster"
+  		prev_list=$sh_cluster
+  	fi
+  	echo
+  done
+  #
+
+  NGNIX_CONF="/opt/splunk-n-box/nginx.conf"
+  #generate nginx.conf
+  echo -e "upstream app {\nleast_conn;" > ${NGNIX_CONF}
+
+  count=`docker ps -aq|wc -l`
+  if [ $count == 0 ]; then
+  	echo "No containers to list" #whats the default server output? matter?
+  fi
+  for id in $(docker ps -aq); do
+      internal_ip=`docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $id`
+      bind_ip=`docker inspect --format '{{ .HostConfig }}' $id| $GREP -o '[0-9]\+[.][0-9]\+[.][0-9]\+[.][0-9]\+'| head -1`
+      #hoststate=`docker ps -a --filter id=$id --format "{{.Status}}" | awk '{print $1}'`
+      hostname=`docker ps -a --filter id=$id --format "{{.Names}}"`
+
+      if ( contains "$hostname" "SH" ); then
+        echo -e "server $internal_ip:8000 max_fails=3 fail_timeout=60 weight=1; #$hostname \n" >> ${NGNIX_CONF}
+      fi
+  done
+  echo '}
+  server {
+    listen 80 default_server;
+
+    location / {
+      proxy_pass http://app;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+    }
+  }
+  ' >> ${NGNIX_CONF}
+  cat ${NGNIX_CONF}
+
+  #if(not already running) # or could just issue a stop them rm of LB01 each time. more devops
+    docker run -d --network=splunk-net --hostname=LB01 --name=LB01 --dns=192.168.1.19 -p 192.168.17.50:80:80 -v ${NGNIX_CONF}:/etc/nginx/conf.d/default.conf -d nginx
+    read -p "Hit <ENTER> to continue..."
+
+  #else
+    docker restart LB01
+    read -p "Hit <ENTER> to continue..."
+
+    curl --verbose --url "http://192.168.17.50" >&3
+
+    read -p "Hit <ENTER> to continue..."
+
+  # then restart it or run if not already running?
+  # really should not use this if more than 1 stand alone search head
+}
+#
 #-----------------------------------------------------------------------------
 update_deployment_apps () {
 #finds a DS* container and copies deployment-apps to there, then reloads the deployment server
@@ -862,6 +958,7 @@ dep_list=`docker ps -a --filter name="DEP|dep" --format "{{.Names}}"|sort`
 ds_list=`docker ps -a --filter name="DS|ds" --format "{{.Names}}"|sort`
 hf_list=`docker ps -a --filter name="HF|hf" --format "{{.Names}}"|sort`
 uf_list=`docker ps -a --filter name="UF|uf" --format "{{.Names}}"|sort`
+lb_list=`docker ps -a --filter name="LB|lb" --format "{{.Names}}"|sort`
 
 echo "------------ Servers grouped by hostname (i.e. role) ---------------"
 printf "${Purple}LMs${NC}: " ;      printf "%-5s " $lm_list;echo
@@ -869,11 +966,14 @@ printf "${Purple}CMs${NC}: " ;      printf "%-5s " $cm_list;echo
 printf "${Yellow}IDXs${NC}: ";      printf "%-5s " $idx_list;echo
 printf "${Green}SHs${NC}: ";        printf "%-5s " $sh_list;echo
 printf "${Cyan}DSs${NC}: ";         printf "%-5s " $ds_list;echo
-printf "${OrangeBrown}DEPs${NC}: "; printf "%-5s " $dep_list;echo
+printf "${BrownOrange}DEPs${NC}: "; printf "%-5s " $dep_list;echo
 printf "${Blue}HFs${NC}: ";         printf "%-5s " $hf_list;echo
 printf "${LightBlue}UFs${NC}: ";    printf "%-5s " $uf_list;echo
+printf "${LightGreen}LBs${NC}: ";    printf "%-5s " $lb_list;echo
 echo
-
+#Green="\033[0;32m";             LightGreen="\033[1;32m"
+#Blue="\033[0;34m";              LightBlue="\033[1;34m"
+#BoldYellowBlueBackground="\e[1;33;44m"
 echo "---------- Current running IDXC's -------"
 for i in $cm_list; do
 	printf "${Yellow}$i${NC}: "
@@ -1688,7 +1788,7 @@ display_menu () {
 	printf "${LightBlue}9${NC}) RESTART all splunkd instances\n\n"
 	printf "${Green}10${NC}) Clustering Menu \n\n"
   printf "${Cyan}11${NC}) Deployment Server Menu \n\n"
-
+  printf "${LightBlue}12${NC}) ReGenerate SH Load Balancer Configs & Bounce\n\n"
 	echo
 return 0
 }    #end display_menu()
@@ -1871,6 +1971,8 @@ do
 		10 ) clustering_menu ;;
 
     11) deployment_server_menu;;
+
+    12) update_nginx_conf ;;
 
 		q|Q ) echo;
 		      echo -e "Quitting... Please send feedback to mhassan@splunk.com! \0360\0237\0230\0200\n";
