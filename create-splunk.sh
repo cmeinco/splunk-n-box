@@ -42,10 +42,13 @@
 # -fix:os checks for bc and dnsmasq
 # -initially create the project home dir or use pwd by default instead of /home/<user>/; copyig over initial files if they do not exist.
 # -way to jump out of the menu into ssh session of a box?
+# -way to run a quick splunk cmd on a box
 # -chaos monkey like; drop some random boxes
 # -need a way to run searches / validation test cases./ run a test suite
 # -fix:something broken:spin up LB01 then do SHC, start at LB01+1 instead of START_ALIAS_LINUX
 # -fix:parameterize LB01 name and IP
+# -fix:handle shutdown of LB not being Splunk
+#
 #################################################################################
 
 #Network stuff
@@ -587,25 +590,17 @@ fi
 return 0
 } #end add_license_file()
 #-----------------------------------------------------------------------------
+#---------------------------------------------------------------------------------
+generate_ngnix_config () {
 #
-update_nginx_conf () {
-  # may want to test to single stand alone SH
-  # OR more expected test going to SH in SHC
-  sh_list=`docker ps -a --filter name="SH|sh" --format "{{.Names}}"|sort`
-  printf "${Green}SHs${NC}: ";        printf "%-5s " $sh_list;echo
-  echo "---------- Current running SHC's -------"
-  prev_list=''
-  for i in $sh_list; do
-  	sh_cluster=`docker exec -ti $i /opt/splunk/bin/splunk show shcluster-status -auth $USERADMIN:$USERPASS | $GREP -i label |awk '{print $3}'| sed -e 's/^M//g' | tr -d '\r' | tr  '\n' ' ' `
-  	if ( contains "$sh_cluster" "$prev_list" );  then
-  		continue
-  	else
-      printf "${Yellow}$i${NC}: %s" "$sh_cluster"
-  		prev_list=$sh_cluster
-  	fi
-  	echo
-  done
-  #
+#input:
+# $1 - initial SH hostname
+# $2 - LB
+
+#call the SH splunk to get the list of cluster members
+#captain=`docker exec -ti $i /opt/splunk/bin/splunk show shcluster-status|head -10 | $GREP -i label |awk '{print $3}'| sed -e 's/^M//g' | tr -d '\r' | tr  '\n' ' '`
+sh_hostname=$1
+lb_hostname=$2
 
   NGNIX_CONF="/opt/splunk-n-box/nginx.conf"
   #generate nginx.conf
@@ -621,6 +616,86 @@ update_nginx_conf () {
       #hoststate=`docker ps -a --filter id=$id --format "{{.Status}}" | awk '{print $1}'`
       hostname=`docker ps -a --filter id=$id --format "{{.Names}}"`
 
+      #using internal_ip here, works and more realistic. bind_ip can be used if want to change config to do redirect or something
+      if ( contains "$hostname" "SH" ); then
+        echo -e "server $internal_ip:8000 max_fails=3 fail_timeout=60 weight=1; #$hostname \n" >> ${NGNIX_CONF}
+      fi
+  done
+  echo '}
+  server {
+    listen 80 default_server;
+
+    location / {
+      proxy_pass http://app;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+    }
+  }
+  ' >> ${NGNIX_CONF}
+  echo
+  cat ${NGNIX_CONF}
+
+  docker cp ${NGNIX_CONF} ${lb_hostname}:/etc/nginx/conf.d/default.conf
+  docker restart ${lb_hostname}
+
+  #call this prob as many times as SHs in the cluster to check the round robin
+  curl --silent --url "http://${START_ALIAS}/en-US/account/login?return_to=%2Fen-US%2F"| grep -o '[0-9]\+[.][0-9]\+[.][0-9]\+[.][0-9]\+' >&4
+  curl --silent --url "http://${START_ALIAS}/en-US/account/login?return_to=%2Fen-US%2F"| grep -o '[0-9]\+[.][0-9]\+[.][0-9]\+[.][0-9]\+' >&4
+  curl --silent --url "http://${START_ALIAS}/en-US/account/login?return_to=%2Fen-US%2F"| grep -o '[0-9]\+[.][0-9]\+[.][0-9]\+[.][0-9]\+' >&4
+
+
+} # end generate_ngnix_config
+#---------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------
+update_nginx_conf () {
+  # may want to test to single stand alone SH
+  # OR more expected test going to SH in SHC
+  # todo: put in a protection check to prevent stupid things like LB to a bunch of stand alone search heads
+
+  #use this loop (stolen from elsewhere) to see if SHC is setup on SHs
+  sh_list=`docker ps -a --filter name="SH|sh" --format "{{.Names}}"|sort`
+  printf "${Green}SHs${NC}: ";        printf "%-5s " $sh_list;echo
+  echo "---------- Current running SHC's -------"
+  prev_list=''
+  for i in $sh_list; do
+  	sh_cluster=`docker exec -ti $i /opt/splunk/bin/splunk show shcluster-status -auth $USERADMIN:$USERPASS | $GREP -i label |awk '{print $3}'| sed -e 's/^M//g' | tr -d '\r' | tr  '\n' ' ' `
+  	if ( contains "$sh_cluster" "$prev_list" );  then
+  		continue
+  	else
+      printf "${Yellow}$i${NC}: %s" "$sh_cluster"
+  		prev_list=$sh_cluster
+  	fi
+  	echo
+  done
+
+
+  count=`docker ps -a --filter name="SH|sh" --format "{{.Names}}"|wc -l`
+  if [ $count == 0 ]; then
+    echo -e "No containers to list\n"
+  elif [ $count == 1 ]; then
+    echo -e "1 containers to list\n"
+  elif [ $count == 2 ]; then
+    echo -e "2 containers, possibly dangerous\n"
+  elif [ $count -ge 3 ]; then
+    echo -e "3+ containers, who knows.\n"
+  fi
+
+  NGNIX_CONF="/opt/splunk-n-box/nginx.conf"
+  #generate nginx.conf
+  echo -e "upstream app {\nleast_conn;" > ${NGNIX_CONF}
+
+  count=`docker ps -aq|wc -l`
+  if [ $count == 0 ]; then
+  	echo "No containers to list" #whats the default server output? matter?
+  fi
+  for id in $(docker ps -aq); do
+      internal_ip=`docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $id`
+      bind_ip=`docker inspect --format '{{ .HostConfig }}' $id| $GREP -o '[0-9]\+[.][0-9]\+[.][0-9]\+[.][0-9]\+'| head -1`
+      #hoststate=`docker ps -a --filter id=$id --format "{{.Status}}" | awk '{print $1}'`
+      hostname=`docker ps -a --filter id=$id --format "{{.Names}}"`
+
+      #using internal_ip here, works and more realistic. bind_ip can be used if want to change config to do redirect or something
       if ( contains "$hostname" "SH" ); then
         echo -e "server $internal_ip:8000 max_fails=3 fail_timeout=60 weight=1; #$hostname \n" >> ${NGNIX_CONF}
       fi
@@ -640,21 +715,39 @@ update_nginx_conf () {
   cat ${NGNIX_CONF}
 
   #if(not already running) # or could just issue a stop them rm of LB01 each time. more devops
-    docker run -d --network=splunk-net --hostname=LB01 --name=LB01 --dns=192.168.1.19 -p 192.168.17.50:80:80 -v ${NGNIX_CONF}:/etc/nginx/conf.d/default.conf -d nginx
-    read -p "Hit <ENTER> to continue..."
+  #cheating on the ip by using the starting number since the above code appears to use the +1 number first.
+  #isntead of v linking the file, prob should generate, copy to the container and just bounce, so we can spinup as many as we want in a detached way.
 
-  #else
+
+    #docker run -d --network=splunk-net --hostname=LB01 --name=LB01 --dns=${DNSSERVER} -p ${START_ALIAS}:80:80 -v ${NGNIX_CONF}:/etc/nginx/conf.d/default.conf -d nginx
+
+
+    #docker run -d --network=splunk-net --hostname=LB01 --name=LB01 --dns=${DNSSERVER} -p ${START_ALIAS}:80:80 -d nginx
+
+    docker cp ${NGNIX_CONF} LB01:/etc/nginx/conf.d/default.conf
     docker restart LB01
-    read -p "Hit <ENTER> to continue..."
+    #read -p "Hit <ENTER> to continue..."
 
-    curl --verbose --url "http://192.168.17.50" >&3
+    #else
 
-    read -p "Hit <ENTER> to continue..."
+    #read -p "Hit <ENTER> to continue..."
+
+
+    #read -p "Hit <ENTER> to continue..."
 
   # then restart it or run if not already running?
   # really should not use this if more than 1 stand alone search head
+
+#  root@ubuntu:/opt/splunk-n-box# docker exec -ti SH01 /opt/splunk/bin/splunk show shcluster-status -auth admin:hello | grep -i label |awk '{print $3}'| sed -e 's/^M//g' | tr -d '\r' | tr  '\n' ' '
+#  SH03 SH03 SH02 SH01 root@ubuntu:/opt/splunk-n-box#4 /opt/splunk/bin/splunk show shcluster-status -auth admin:hello ^C
+#  root@ubuntu:/opt/splunk-n-box# docker exec -ti SH04 /opt/splunk/bin/splunk show shcluster-status -auth admin:hello
+
+#   In handler 'shclusterstatus': Search Head Clustering is not enabled on this node. REST endpoint is not available
+#  root@ubuntu:/opt/splunk-n-box#
+
+
 }
-#
+# end generate_ngnix_config
 #-----------------------------------------------------------------------------
 update_deployment_apps () {
 #finds a DS* container and copies deployment-apps to there, then reloads the deployment server
@@ -781,20 +874,25 @@ printf "${LightGray}\t->Pausing $1 seconds... ${Green}Done!${NC}\n"  >&3
 #---------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------------------------------
 restart_splunkd () {
-#1: hostname
-#$2=b Execute in the background and don't wait to return.This will speed up everything but load the CPU
+# $1 hostname
+# $2=b Execute in the background and don't wait to return. This will speed up everything but load the CPU
 
-if [ "$2" == "b" ]; then
-	printf "\t->Restarting splunkd in the background " >&3
-        CMD="docker exec -d $1 /opt/splunk/bin/splunk restart "
-        OUT=`$CMD`; display_output "$OUT" "Starting splunk server daemon" "n" "3"
-   	printf "${DarkGray}CMD:[$CMD]${NC}\n" >&4
-else
-	printf "\t->Restarting splunkd. Please wait! " >&3
-	CMD="docker exec -ti $1 /opt/splunk/bin/splunk restart "
-        OUT=`$CMD`; display_output "$OUT" "Starting splunk server daemon" "n" "3"
-   	printf "${DarkGray}CMD:[$CMD]${NC}\n" >&4
-fi
+  if [ "$2" == "b" ]; then
+    printf "\t->Restarting splunkd in the background " >&3
+    CMD="docker exec -d $1 /opt/splunk/bin/splunk restart "
+  else
+    printf "\t->Restarting splunkd. Please wait! " >&3
+    CMD="docker exec $1 /opt/splunk/bin/splunk restart "
+  fi
+
+  if ( contains "$1" "LB" ); then
+    CMD="docker restart $1"
+  else
+    CMD="docker exec -d $1 /opt/splunk/bin/splunk restart "
+  fi
+
+  OUT=`$CMD`; display_output "$OUT" "Starting splunk server daemon" "n" "3"
+  printf "${DarkGray}CMD:[$CMD]${NC}\n" >&4
 
 return 0
 } #end restart_splunkd()
@@ -1068,7 +1166,71 @@ echo "localhost,"$name","$name","$name","$role",,,,," >  $MOUNTPOINT/$name/etc/a
 return 0
 }
 #---------------------------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------
+create_single_lbhost () {
+#This function creates single splunk container using $vip and $hostname
+#inputs:
+#  $1: container's IP to use (nated IP aka as bind IP)
+#	 $2: fullhostname:  container name (may include site and host number sequence)
 
+START1=$(date +%s);
+	vip=$1  fullhostname=$2
+	fullhostname=`echo $fullhostname| tr -d '[[:space:]]'`	#trim white space if they exist
+
+	check_load		#throttle back if high load
+
+	#echo "fullhostname[$fullhostname]"
+	#rm -fr $MOUNTPOINT/$fullhostname
+	mkdir -m 777 -p $MOUNTPOINT/$fullhostname
+
+  #      CMD="docker run -d --network=$SPLUNKNET --hostname=$fullhostname --name=$fullhostname --dns=$DNSSERVER  -p $vip:$SPLUNKWEB_PORT:$SPLUNKWEB_PORT -p $vip:$MGMT_PORT:$MGMT_PORT -p $vip:$SSHD_PORT:$SSHD_PORT -p $vip:$KV_PORT:$KV_PORT -p $vip:$IDX_PORT:$IDX_PORT -p $vip:$REPL_PORT:$REPL_PORT --env SPLUNK_START_ARGS="--accept-license" --env SPLUNK_ENABLE_LISTEN=$IDX_PORT --env SPLUNK_SERVER_NAME=$fullhostname --env SPLUNK_SERVER_IP=$vip $SPLUNK_IMAGE"
+    CMD="docker run -d --network=$SPLUNKNET --hostname=$fullhostname --name=$fullhostname --dns=${DNSSERVER} -p ${START_ALIAS}:80:80 -d nginx"
+
+	printf "[${Purple}$fullhostname${NC}:${DarkGray}$vip${NC}] ${LightBlue}Creating new lb docker container ${NC} "
+	OUT=`$CMD` ; display_output "$OUT" "Error" "" "2"
+	#CMD=`echo $CMD | sed 's/\t//g' `;
+	printf "${DarkGray}CMD:[$CMD]${NC}\n" >&4
+	#echo_logline "[${Purple}$fullhostname${NC}:${Cyan}$vip${NC}] Creating new splunk container..." >> ${LOGFILE}
+
+	if [ "$os" == "Darwin" ]; then
+		pausing "30"
+	else
+		pausing "15"
+	fi
+        #set home screen banner in web.conf & change default admin password
+	#printf "\t->Splunk initialization (pass change, licenses, login screen)..." >&3
+	#custom_login_screen "$vip" "$fullhostname"
+
+	#add_license_file $fullhostname
+
+  #add_deploymentclient_file $fullhostname
+
+	#Misc OS stuff
+  #      CMD=`docker cp $PROJ_DIR/containers.bashrc $fullhostname:/root/.bashrc`
+        #install stuff you will need in  background
+        #CMD=`docker exec -it $fullhostname apt-get update > /dev/null >&1`
+        #CMD=`docker exec -it $fullhostname apt-get install -y vim net-tools telnet dnsutils > /dev/null >&1`
+
+#DNS stuff to be used with dnsmasq. Need to revisit for OSX  9/29/16
+#Enable for Linux at this point
+if [ "$os" == "Linux" ]; then
+	printf "\t->Updating dnsmasq records[$vip  $fullhostname]..." >&3
+	if [ ! -f $HOSTSFILE ]; then
+		touch $HOSTSFILE
+	fi
+	if [ $(cat $HOSTSFILE | $GREP $fullhostname | wc -l | sed 's/^ *//g') != 0 ]; then
+        	printf "\t${Red}[$fullhostname] is already in the hosts file. Removing...${NC}\n" >&4
+        	cat $HOSTSFILE | $GREP -v $vip | sort > tmp && mv tmp $HOSTSFILE
+	fi
+	printf "${Green}OK!${NC}\n" >&3
+	printf "$vip\t$fullhostname\n" >> $HOSTSFILE
+	killall -HUP dnsmasq	#must refresh to read $HOSTFILE file
+fi
+
+return 0
+
+}  #end create_single_lbhost ()
+#---------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------
 create_single_splunkhost () {
 #This function creates single splunk container using $vip and $hostname
@@ -1150,6 +1312,22 @@ gLIST=""   #build global list of hosts created by this session. Used somewhere e
 #Another method to figure out the starting octet4
 # OCTET4FILE=`iptables -t nat -L |$GREP DNAT | awk '{print $5}'  | sort -u|tail -1|cut -d"." -f4`
 #printf "$D1 _________create_generic_splunk():  basename[$1]  hostcount[$2]  site[$3]__________${NC}\n"
+
+#print recommended names
+
+if [ -z "$1" ]; then
+  echo -e "\n${DarkGray}------------ Recommended hostnames Base (i.e. role) ---------------"
+  printf "${Purple}LM${NC}: License Master\n" ;
+  printf "${Purple}CM${NC}: Cluster Master\n" ;
+  printf "${Yellow}IDX${NC}: Indexer\n";
+  printf "${Green}SH${NC}: Search Head\n";
+  printf "${Cyan}DS${NC}: Deployment Server\n";
+  printf "${BrownOrange}DEPs${NC}: Search Head Cluster Deployer\n";
+  printf "${Blue}HF${NC}: Heavy Forwarder\n";
+  printf "${LightBlue}UF${NC}: Universal Forwarder\n";
+  printf "${LightGreen}LB${NC}: Load Balancer (ngnix)\n\n";
+  #DMC : Distributed Management Console ( splunk 6.5 name changed to Monitoring Console)
+fi
 
 #---Prompt user for host basename (if not in auto mode) -----
 if [ -z "$1" ]; then
@@ -1234,7 +1412,12 @@ do
      	vip="$base_ip.$octet4"            	#build new IP to be assigned
 	#printf "$D1:create_generic_linux():fulhostname:[$fullhostname] vip:[$vip] basename:[$basename] count[$count] ${NC}\n";
 
-	create_single_splunkhost $vip $fullhostname
+  if ( contains "$fullhostname" "LB" ); then
+    create_single_lbhost $vip $fullhostname
+  else
+    create_single_splunkhost $vip $fullhostname
+  fi
+
 	gLIST="$gLIST""$fullhostname "
 
 done  #end for loop
@@ -1387,6 +1570,21 @@ OUT=`$CMD`
 display_output "$OUT" "Captain" "n" "2"
 printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&4
 printf "${LightBlue}___________ Finished STEP#4 (cluster status) ___________________________________${NC}\n" >&3
+
+printf "${LightBlue}___________ Starting STEP#5 (Build LB for SHs) __________________________________${NC}\n" >&3
+#printf "[${Purple}$i${NC}]${LightBlue}==> Checking SHC status (on captain)...${NC}"
+
+create_generic_splunk "LB" "1"; lb="$gLIST"
+printf "${DarkGray} ${lb} Created"
+
+generate_ngnix_config "$i" "${lb}"
+
+#CMD="docker exec -ti $i /opt/splunk/bin/splunk show shcluster-status -auth $USERADMIN:$USERPASS "
+#OUT=`$CMD`
+#display_output "$OUT" "Captain" "n" "2"
+#printf " ${DarkGray}CMD:[$CMD]${NC}\n" >&4
+printf "${LightBlue}___________ Finished STEP#5 (Build LB for SHs) ___________________________________${NC}\n" >&3
+
 
 END=$(date +%s);
 TIME=`echo $((END-START1)) | awk '{print int($1/60)":"int($1%60)}'`
@@ -1664,7 +1862,7 @@ for str in $SITEnames; do
 		printf "[${Purple}$i${NC}]${Cyan} Migrating Indexer (restarting takes time)... ${NC}\n"
 		CMD="docker exec -ti $i /opt/splunk/bin/splunk edit cluster-config -site $site -master_uri https://$cm_ip:$MGMT_PORT -replication_port $REPL_PORT  -auth $USERADMIN:$USERPASS "
 		OUT=`$CMD`
-        	OUT=`echo $OUT | sed -e 's/^M//g' | tr -d '\r' | tr -d '\n' `    #clean up
+    OUT=`echo $OUT | sed -e 's/^M//g' | tr -d '\r' | tr -d '\n' `    #clean up
 
 		printf "\t${DarkGray}CMD:[$CMD]${NC}\n" >&4
 		printf "\t->Configuring multisite clustering for [site:$site location:$str] " >&3
@@ -1714,16 +1912,16 @@ display_menu2 () {
 	printf "${Yellow}B${NC}) Go back to MAIN menu\n\n"
 
 	printf "${Purple}AUTO BUILDS (fixed: R3/S2 1-CM 1-DEP 3-SHC 1-CM 3-IDXC):\n"
-        printf "${Purple}1${NC}) Create Stand-alone Index Cluster (IDXC)\n";
-        printf "${Purple}2${NC}) Create Stand-alone Search Head Cluster (SHC)\n"
-        printf "${Purple}3${NC}) Build Single-site Cluster\n"
-        printf "${Purple}4${NC}) Build Multi-site Cluster (3 sites)${NC} \n";echo
+  printf "${Purple}1${NC}) Create Stand-alone Index Cluster (IDXC)\n";
+  printf "${Purple}2${NC}) Create Stand-alone Search Head Cluster (SHC)\n"
+  printf "${Purple}3${NC}) Build Single-site Cluster\n"
+  printf "${Purple}4${NC}) Build Multi-site Cluster (3 sites)${NC} \n";echo
 
 	printf "${LightBlue}MANUAL BUILDS (specify base hostnames and counts)\n"
-        printf "${LightBlue}5${NC}) Create Manual Stand-alone Index cluster (IDXC)\n";
+  printf "${LightBlue}5${NC}) Create Manual Stand-alone Index cluster (IDXC)\n";
 	printf "${LightBlue}6${NC}) Create Manual Stand-alone Search Head Cluster (SHC)\n"
-        printf "${LightBlue}7${NC}) Build Manual Single-site Cluster\n"
-        printf "${LightBlue}8${NC}) Build Manual Multi-site Cluster${NC} \n";echo
+  printf "${LightBlue}7${NC}) Build Manual Single-site Cluster\n"
+  printf "${LightBlue}8${NC}) Build Manual Multi-site Cluster${NC} \n";echo
 return 0
 } #display_menu2()
 #---------------------------------------------------------------------------------------------------------------
@@ -1737,23 +1935,23 @@ do
         choice=""
         read -p "Select a number: " choice
                 case "$choice" in
-	        B|b) return 0;;
+    B|b) return 0;;
 
 		1 ) create_single_idxc "AUTO"; read -p "Hit <ENTER> to continue..." ;;
-                2 ) create_single_shc  "AUTO"; read -p "Hit <ENTER> to continue..." ;;
-                3 ) build_single_site "AUTO"; read -p "Hit <ENTER> to continue..." ;;
-                4 ) build_multi_site_cluster "AUTO"; read -p "Hit <ENTER> to continue..." ;;
+    2 ) create_single_shc  "AUTO"; read -p "Hit <ENTER> to continue..." ;;
+    3 ) build_single_site "AUTO"; read -p "Hit <ENTER> to continue..." ;;
+    4 ) build_multi_site_cluster "AUTO"; read -p "Hit <ENTER> to continue..." ;;
 
-                5 ) 	printf "${White} *Please remember to follow host naming convention..${NC}\n";
-			create_single_idxc;
-			read -p "Hit <ENTER> to continue..." ;;
+    5 ) 	printf "${White} *Please remember to follow host naming convention..${NC}\n";
+        create_single_idxc;
+        read -p "Hit <ENTER> to continue..." ;;
 		6 ) 	printf "Please remember to follow host naming convention..\n";
 			create_single_shc;
 			read -p "Hit <ENTER> to continue..." ;;
-                7 ) 	printf "Please remember to follow host naming convention..\n";
+    7 ) 	printf "Please remember to follow host naming convention..\n";
 			build_single_site;
 			read -p "Hit <ENTER> to continue..."  ;;
-                8 ) 	printf "Please remember to follow host naming convention..\n";
+    8 ) 	printf "Please remember to follow host naming convention..\n";
 			build_multi_site_cluster;
 			read -p "Hit <ENTER> to continue..."  ;;
 
@@ -1789,6 +1987,7 @@ display_menu () {
 	printf "${Green}10${NC}) Clustering Menu \n\n"
   printf "${Cyan}11${NC}) Deployment Server Menu \n\n"
   printf "${LightBlue}12${NC}) ReGenerate SH Load Balancer Configs & Bounce\n\n"
+
 	echo
 return 0
 }    #end display_menu()
@@ -1954,10 +2153,14 @@ do
 		2 ) echo "Starting all containers: "; docker start $(docker ps -a --format "{{.Names}}") ;;
 		3 ) echo "Stopping all containers (graceful): ";
 		   for i in `docker ps --format "{{.Names}}"`; do
-			printf "${Purple}$i${NC} "
-                        docker exec $i /opt/splunk/bin/splunk stop ;
-		    	docker stop -t30 $i;
-                        done;;
+         printf "\n${Purple}$i${NC} "
+         if ( contains "$i" "LB" ); then
+          continue
+         else
+          docker exec $i /opt/splunk/bin/splunk stop ;
+         fi
+         docker stop -t30 $i;
+       done ;;
 		4 ) show_groups ;;
 		5 ) for i in `docker ps --format "{{.Names}}"`; do reset_splunk_passwd $i; done ;;
 		6 ) for i in `docker ps --format "{{.Names}}"`; do add_license_file $i; done ;;
@@ -1965,12 +2168,16 @@ do
 		7 ) splunkd_status_all ;;
 		8 ) remove_ip_aliases ;;
 		9) for i in `docker ps --format "{{.Names}}"`; do
-			restart_splunkd "$i"
-	        	done;;
+          if ( contains "$i" "LB" ); then
+            docker restart "$i"
+          else
+            restart_splunkd "$i"
+          fi
+       done ;;
 
 		10 ) clustering_menu ;;
 
-    11) deployment_server_menu;;
+    11) deployment_server_menu ;;
 
     12) update_nginx_conf ;;
 
